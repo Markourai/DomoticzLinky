@@ -398,7 +398,7 @@ class BasePlugin:
             self.daysAccumulate = val;
     
     # Grab days data inside received JSON data for history
-    def exploreDataDays(self, Data, bLocalFirstMonths):
+    def exploreDataDays(self, Data):
         self.dumpDictToLog(Data)
         if Data and "Data" in Data:
             try:
@@ -438,9 +438,9 @@ class BasePlugin:
                             if not self.createAndAddToDevice(val, datetimeToSQLDateString(curDate)):
                                 return False
                             # If we are on the most recent batch and end date, use the mose recent data for Domoticz dashboard
-                            if bLocalFirstMonths and (curDate == endDate):
+                            if self.bFirstMonths and (curDate == endDate):
                                 #Domoticz.Log("Update " + str(val) + " " + datetimeToSQLDateString(curDate))
-                                bLocalFirstMonths = False
+                                self.bFirstMonths = False
                                 if not self.updateDevice(self.daysAccumulate):
                                     return False
                     return True
@@ -568,7 +568,7 @@ class BasePlugin:
                 self.bHasAFail = True
             else:
                 # Analyse data for days
-                if not self.exploreDataDays(Data, self.bFirstMonths):
+                if not self.exploreDataDays(Data):
                     self.bHasAFail = True
                 if self.iDaysLeft > 0:
                     self.calculateDaysLeft()
