@@ -21,7 +21,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 """
-<plugin key="linky" name="Linky" author="Barberousse" version="1.1.1" externallink="https://github.com/guillaumezin/DomoticzLinky">
+<plugin key="linky" name="Linky" author="Barberousse" version="1.1.6" externallink="https://github.com/guillaumezin/DomoticzLinky">
     <params>
         <param field="Username" label="Adresse e-mail" width="200px" required="true" default=""/>
         <param field="Password" label="Mot de passe" width="200px" required="true" default="" password="true"/>
@@ -45,8 +45,9 @@
         <param field="Mode2" label="Nombre de jours à récupérer pour les autres vues (28 min)" width="50px" required="false" default="366"/>
         <param field="Mode3" label="Debug" width="75px">
             <options>
-                <option label="Oui" value="Debug"/>
-                <option label="Non" value="Normal"  default="true" />
+                <option label="Non" value="0"  default="true" />
+                <option label="Oui" value="1"/>
+                <option label="Avancé" value="2"/>
             </options>
         </param>
     </params>
@@ -143,13 +144,17 @@ class BasePlugin:
     # integer: number of other view
     iHistoryDaysForDaysView = None
     # boolean: debug mode
-    bDebug = None
+    iDebugLevel = None
     
     def __init__(self):
         self.isStarted = False
         self.httpConn = None
         self.sConnectionStep = "idle"
         self.bHasAFail = False
+        
+    def myDebug(self, message):
+        if self.iDebugLevel:
+            Domoticz.Log(message)
 
     # Reset saved cookies
     def resetCookies(self):
@@ -250,7 +255,7 @@ class BasePlugin:
             'p_p_cacheability': 'cacheLevelPage',
             'p_p_col_id': 'column-1',
             'p_p_col_pos': 1,
-            'p_p_col_count': 3
+            'p_p_col_count': 2
         }
         
         sendData = {
@@ -278,7 +283,9 @@ class BasePlugin:
         if not self.createDevice():
             return False
         # -1.0 for counter because Linky doesn't provide absolute counter value via Enedis website
-        Devices[self.iIndexUnit].Update(nValue=0, sValue="-1.0;"+ str(usage) + ";"  + str(Date), Type=self.iType, Subtype=self.iSubType, Switchtype=self.iSwitchType,)
+        sValue = "-1.0;"+ str(usage) + ";"  + str(Date)
+        self.myDebug("Mets dans la BDD la valeur " + sValue)
+        Devices[self.iIndexUnit].Update(nValue=0, sValue=sValue, Type=self.iType, Subtype=self.iSubType, Switchtype=self.iSwitchType,)
         return True
 
     # Update value shown on Domoticz dashboard
@@ -286,7 +293,9 @@ class BasePlugin:
         if not self.createDevice():
             return False
         # -1.0 for counter because Linky doesn't provide absolute counter value via Enedis website
-        Devices[self.iIndexUnit].Update(nValue=0, sValue="-1.0;"+ str(usage), Type=self.iType, Subtype=self.iSubType, Switchtype=self.iSwitchType)
+        sValue="-1.0;"+ str(usage)
+        self.myDebug("Mets sur le tableau de bord la valeur " + sValue)
+        Devices[self.iIndexUnit].Update(nValue=0, sValue=sValue, Type=self.iType, Subtype=self.iSubType, Switchtype=self.iSwitchType)
         return True
 
     # Show error in state machine context
@@ -356,6 +365,8 @@ class BasePlugin:
                     if not dataSeenToTheEnd:
                         self.showStepError(True, "Données manquantes")                        
                     return dataSeenToTheEnd
+                elif dJson and ("etat" in dJson) and ("valeur" in dJson["etat"]):
+                    self.showStepError(True, "Erreur à la réception de données JSON (code : " + str(dJson["etat"]["valeur"]) + ")")
                 else:
                     self.showStepError(True, "Erreur à la réception de données JSON")
         else:
@@ -444,6 +455,8 @@ class BasePlugin:
                                 if not self.updateDevice(self.daysAccumulate):
                                     return False
                     return True
+                elif dJson and ("etat" in dJson) and ("valeur" in dJson["etat"]):
+                    self.showStepError(True, "Erreur à la réception de données JSON (code : " + str(dJson["etat"]["valeur"]) + ")")
                 else:
                     self.showStepError(False, "Erreur à la réception de données JSON")
         else:
@@ -488,7 +501,7 @@ class BasePlugin:
 
             self.httpConn = Domoticz.Connection(Name="HTTPS connection", Transport="TCP/IP", Protocol="HTTPS", Address=LOGIN_BASE_URI, Port=BASE_PORT)
 
-            Domoticz.Debug("Connect")
+            self.myDebug("Connect")
             self.sConnectionStep = "logconnecting"
             self.httpConn.Connect()
 
@@ -533,7 +546,7 @@ class BasePlugin:
                 self.getData("urlCdcJour", self.dateBeginDays, self.dateEndDays)
 
         # We are now connected to data page, ask for hours data
-        elif self.sConnectionStep == "dataconnecting":
+        elif self.sConnectionStep == "dataconnecting" or self.sConnectionStep == "dataconnecting2":
             if not self.httpConn.Connected():
                 Domoticz.Error("Connexion échouée à la réception des premières données")
                 self.sConnectionStep = "idle"
@@ -554,9 +567,13 @@ class BasePlugin:
                         self.bHasAFail = True
                 else:
                     self.dumpDictToLog(Data)
-                    self.sConnectionStep = "getdatadays"
-                    self.bFirstMonths = True
-                    self.resetDayAccumulate(self.dateEndDays)
+                    # Dummy action again to show that we have the authentication cookie
+                    if self.sConnectionStep == "dataconnecting":
+                        self.sConnectionStep = "dataconnecting2"
+                    else:
+                        self.sConnectionStep = "getdatadays"
+                        self.bFirstMonths = True
+                        self.resetDayAccumulate(self.dateEndDays)
                     # Ask data for days
                     self.getData("urlCdcJour", self.dateBeginDays, self.dateEndDays)
                 
@@ -572,6 +589,7 @@ class BasePlugin:
                     self.bHasAFail = True
                 if self.iDaysLeft > 0:
                     self.calculateDaysLeft()
+                    self.bFirstMonths = False
                     self.sConnectionStep = "getdatadays"
                     self.getData("urlCdcJour", self.dateBeginDays, self.dateEndDays)
                 else:
@@ -603,23 +621,25 @@ class BasePlugin:
             Domoticz.Log("Prochaine connexion : " + datetimeToSQLDateTimeString(self.nextConnection))
 
     def dumpDictToLog(self, dictToLog):
-        if self.bDebug:
+        if self.iDebugLevel:
             if isinstance(dictToLog, dict):
-                Domoticz.Debug("Dict details ("+str(len(dictToLog))+"):")
+                self.myDebug("Dict details ("+str(len(dictToLog))+"):")
                 for x in dictToLog:
                     if isinstance(dictToLog[x], dict):
-                        Domoticz.Debug("--->'"+x+" ("+str(len(dictToLog[x]))+"):")
+                        self.myDebug("--->'"+x+" ("+str(len(dictToLog[x]))+"):")
                         for y in dictToLog[x]:
                             if isinstance(dictToLog[x][y], dict):
                                 for z in dictToLog[x][y]:
-                                    Domoticz.Debug("----------->'" + z + "':'" + str(dictToLog[x][y][z]) + "'")
+                                    self.myDebug("----------->'" + z + "':'" + str(dictToLog[x][y][z]) + "'")
                             else:
-                                Domoticz.Debug("------->'" + y + "':'" + str(dictToLog[x][y]) + "'")
+                                self.myDebug("------->'" + y + "':'" + str(dictToLog[x][y]) + "'")
                     else:
-                        Domoticz.Debug("--->'" + x + "':'" + str(dictToLog[x]) + "'")
+                        self.myDebug("--->'" + x + "':'" + str(dictToLog[x]) + "'")
+            else:
+                self.myDebug("Received no dict: " + str(dictToLog))
                         
     def onStart(self):
-        Domoticz.Debug("onStart called")
+        self.myDebug("onStart called")
         
         Domoticz.Log("Ce plugin est compatible avec Domoticz version 3.9517 et plus récent, mais la vue par heure peut ne pas fonctionner avec la version 4.9700")
         
@@ -627,9 +647,15 @@ class BasePlugin:
         self.sPassword = Parameters["Password"]
         self.iHistoryDaysForHoursView = Parameters["Mode1"]
         self.iHistoryDaysForDaysView = Parameters["Mode2"]
-        self.bDebug = Parameters["Mode3"] == "True"
         self.bAutoAcceptTerms = Parameters["Mode4"] == "True"
         self.sConsumptionType = Parameters["Mode5"]
+        try:
+            self.iDebugLevel = int(Parameters["Mode3"])
+        except ValueError:
+            self.iDebugLevel = 0
+    
+        if self.iDebugLevel > 1:
+            Domoticz.Debugging(1)
 
         # History for short log is 7 days max (default to 7)
         try:
@@ -669,17 +695,13 @@ class BasePlugin:
         Domoticz.Log("Accepter automatiquement les conditions d'utilisation mis à " + str(self.bAutoAcceptTerms))
         Domoticz.Log("Nombre de jours à récupérer pour la vue par heures mis à " + str(self.iHistoryDaysForHoursView))
         Domoticz.Log("Nombre de jours à récupérer pour les autres vues mis à " + str(self.iHistoryDaysForDaysView))
-        Domoticz.Log("Debug mis à " + str(self.bDebug))
+        Domoticz.Log("Debug mis à " + str(self.iDebugLevel))
         
         # most init
         self.__init__()
 
         Domoticz.Log("Si vous ne voyez pas assez de données dans la vue par heures, augmentez le paramètre Log des capteurs qui se trouve dans Réglages / Paramètres / Historique des logs")
         
-        # enable debug if required
-        if self.bDebug == "Debug":
-            Domoticz.Debugging(1)            
-
         if self.createDevice():
             self.nextConnection = datetime.now()
         else:
@@ -779,15 +801,15 @@ def dictToQuotedString(dParams):
 def DumpConfigToLog():
     for x in Parameters:
         if Parameters[x] != "":
-            Domoticz.Debug( "'" + x + "':'" + str(Parameters[x]) + "'")
-    Domoticz.Debug("Device count: " + str(len(Devices)))
+            self.myDebug( "'" + x + "':'" + str(Parameters[x]) + "'")
+    self.myDebug("Device count: " + str(len(Devices)))
     for x in Devices:
-        Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
-        Domoticz.Debug("Device ID:       '" + str(Devices[x].ID) + "'")
-        Domoticz.Debug("Device Name:     '" + Devices[x].Name + "'")
-        Domoticz.Debug("Device iValue:    " + str(Devices[x].iValue))
-        Domoticz.Debug("Device sValue:   '" + Devices[x].sValue + "'")
-        Domoticz.Debug("Device LastLevel: " + str(Devices[x].LastLevel))
+        self.myDebug("Device:           " + str(x) + " - " + str(Devices[x]))
+        self.myDebug("Device ID:       '" + str(Devices[x].ID) + "'")
+        self.myDebug("Device Name:     '" + Devices[x].Name + "'")
+        self.myDebug("Device iValue:    " + str(Devices[x].iValue))
+        self.myDebug("Device sValue:   '" + Devices[x].sValue + "'")
+        self.myDebug("Device LastLevel: " + str(Devices[x].LastLevel))
     return
 
 # Convert Enedis date string to datetime object
