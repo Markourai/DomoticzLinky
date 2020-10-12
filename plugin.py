@@ -8,20 +8,21 @@
 #                       Modified (C) 2018 Barberousse
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of
+# the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the GNU Affero General Public
+# License # along with this program.  If not, see
+# <http://www.gnu.org/licenses/>.
 #
 """
-<plugin key="linky" name="Linky" author="Barberousse" version="2.1.6" externallink="https://github.com/guillaumezin/DomoticzLinky">
+<plugin key="linky" name="Linky" author="Barberousse" version="2.3.0" externallink="https://github.com/guillaumezin/DomoticzLinky">
     <params>
         <param field="Mode4" label="Heures creuses (vide pour désactiver, cf. readme pour la syntaxe)" width="500px" required="false" default="">
 <!--        <param field="Mode4" label="Heures creuses" width="500px">
@@ -113,12 +114,14 @@ import json
 from urllib.parse import quote
 # import re
 from datetime import datetime
+from datetime import date
 from datetime import time
 from datetime import timedelta
 from time import strptime
 # from random import randint
 # import html
 import re
+import tempfile
 
 CLIENT_ID = ["d198fd52-61c0-4b77-8725-06a1ef90da9f", "9c551777-9d1b-447c-9e68-bfe6896ee002"]
 
@@ -236,8 +239,10 @@ class BasePlugin:
     sDeviceCode = None
     # interval to retry
     iInterval = 5
-    # count data packet Error
-    iDataErrorCount = None
+    # no consumption data
+    bNoConsumption = None
+    # no production data
+    bNoProduction = None
     # production mode
     bProdMode = None
     # send nuffer
@@ -256,7 +261,7 @@ class BasePlugin:
     dHc = None
     # dict with calculation to show on dashboard
     dCalculate = None
-    # date
+    # datetime
     dateNextConnection = None
     # integer: which device to use
     iAlternateDevice = 0
@@ -272,6 +277,10 @@ class BasePlugin:
     dtGlobalTimeout = None
     # last refresh
     dtNextRefresh = None
+    # debug file
+    fDebug = None
+    # datetime: last data sent
+    dtLastSend = None
     
     def __init__(self):
         self.isStarted = False
@@ -286,10 +295,28 @@ class BasePlugin:
         self.iUsagePointIndex = 0
         self.lUsagePointIndex = []
         self.dUsagePointTimeout = {}
+        self.dtLastSend = datetime(2000, 1, 1)
 
-    def myDebug(self, message):
-        if self.iDebugLevel:
+    def myDebug(self, message, bNoLog=False):
+        if (not bNoLog) and (self.iDebugLevel > 1):
             Domoticz.Log(message)
+        if self.fDebug:
+            try:
+                self.fDebug.writelines(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " " + message + "\n")
+            except:
+                pass
+
+    def myLog(self, message):
+        Domoticz.Log(message)
+        self.myDebug(message, True)
+
+    def myStatus(self, message):
+        Domoticz.Status(message)
+        self.myDebug("Status : " + message, True)
+
+    def myError(self, message):
+        Domoticz.Error(message)
+        self.myDebug("Erreur : " + message, True)
 
     # resend same data
     def reconnectAndResend(self):
@@ -315,13 +342,21 @@ class BasePlugin:
         self.sBuffer = data
         self.sConnectionNextStep = self.sConnectionStep
         self.sMemConnectionStep = self.sConnectionStep
-        self.sConnectionStep = "connecting"
         self.iTimeoutCount = 0
         self.iResendCount = 0
-        conn = Domoticz.Connection(Name="HTTPS connection", Transport="TCP/IP", Protocol="HTTPS", Address=address,
-                                   Port=port)
-        conn.Connect()
-        return conn
+        dtNow = datetime.now()
+        # Prevent too quick connections, to not trigger protection mechanism
+        if dtNow > (self.dtLastSend + timedelta(seconds=5)):
+            self.dtLastSend = dtNow
+            self.sConnectionStep = "connecting"
+            conn = Domoticz.Connection(Name="HTTPS connection", Transport="TCP/IP", Protocol="HTTPS", Address=address,
+                                Port=port)
+            conn.Connect()
+            return conn
+        else:
+            self.sConnectionStep = "retry"
+            self.setNextConnectionForLater(self.iInterval)
+            return None
 
     # Connect for login
     def connectAndSendForAuthorize(self, data):
@@ -410,7 +445,7 @@ class BasePlugin:
                     sUrl = VERIFY_CODE_URI[self.iAlternateAddress] + quote(sUserCode)
                     if self.iFalseCustomer:
                         sUrl = sUrl + "&state=" + str(self.iFalseCustomer)
-                    Domoticz.Error(
+                    self.myError(
                         "Connectez-vous à l'adresse " + sUrl + " pour lancer la demande de consentement avec le code " + sUserCode)
                     return "done"
                 else:
@@ -600,7 +635,7 @@ class BasePlugin:
         if bDebug:
             self.myDebug(sMessage)
         else:
-            Domoticz.Error(sMessage)
+            self.myError(sMessage)
 
     # Show error in state machine context with dates
     def showStepError(self, hours, logMessage, bDebug=False):
@@ -613,23 +648,38 @@ class BasePlugin:
         if bDebug:
             self.myDebug(sMessage)
         else:
-            Domoticz.Error(sMessage)
+            self.myError(sMessage)
 
     # Parse HP/HC parameter string and store result in dHc
     def parseHcParameter(self, sHcParameter):
         self.dHc = {}
         sLocalUsagePointId = "all"
         iWeekday = 7
+        sProd = "all"
+        
+        sHcParameter = sHcParameter.lower().strip()
 
         # Exemple 963222123213 12h30-14h00
-        # https://regex101.com/r/cMWfqj/4
-        for matchHc in re.finditer(r"(?:(\d+)\s+)?(?:\s*(\D+)\s+)?(\d+)\s*[h:]\s*(\d+)?\s*[-_aà]+\s*(\d+)\s*[h:]\s*(\d+)?", sHcParameter):
-            #Domoticz.Log("match " + matchHc.group(2) + " "  + matchHc.group(3) + " " + matchHc.group(4) + " " + matchHc.group(5))
+        # https://regex101.com/r/cMWfqj/11
+        for matchHc in re.finditer(r"(?:(\d+)(?:$|\s))?(?:([a-zéè]+)(?:$|\s))?(?:([a-zéè]+)(?:$|\s))?(?:(\d+)\s*[h:]\s*(\d+)?\s*(?:[-_aà]|to)+\s*(\d+)\s*[h:]\s*(\d+)?)?", sHcParameter):
+            #Domoticz.Log("match " + matchHc.group(1) + " "  + matchHc.group(2) + " "  + matchHc.group(3) + " " + matchHc.group(4) + " " + matchHc.group(5) + " " + matchHc.group(6) + " " + matchHc.group(7))
             if matchHc.group(1):
                 sLocalUsagePointId = matchHc.group(1).upper().strip()
+                sProd = "all"
+                iWeekday = 7
                 #Domoticz.Log(sLocalUsagePointId)
-            if matchHc.group(2):
-                sDay = matchHc.group(2).lower().strip()
+            sMG2 = matchHc.group(2)
+            if sMG2:
+                sMG2 = sMG2.lower().strip()
+                sMG3 = matchHc.group(3)
+                if sMG3:
+                    sMG3 = sMG3.lower().strip()
+                    sDay = sMG3
+                else:
+                    sDay = sMG2
+                if sMG2.startswith("p"):
+                    sProd = "prod"
+                    iWeekday = 7
                 #Domoticz.Log(sDay)
                 if sDay.startswith("lu") or sDay.startswith("mo"):
                     iWeekday = 0
@@ -645,37 +695,68 @@ class BasePlugin:
                     iWeekday = 5
                 elif sDay.startswith("di") or sDay.startswith("su"):
                     iWeekday = 6
+                elif sDay.startswith("fe") or sDay.startswith("fé") or sDay.startswith("fè") or sDay.startswith("jo") or sDay.startswith("pu")  or sDay.startswith("ba") or sDay.startswith("ho"):
+                    iWeekday = 8
+                else:
+                    iWeekday = 7
                 #Domoticz.Log(sLocalUsagePointId)
             if not sLocalUsagePointId in self.dHc:
                 self.dHc[sLocalUsagePointId] = {}
-            if not iWeekday in self.dHc[sLocalUsagePointId]:
-                self.dHc[sLocalUsagePointId][iWeekday] = []
+            if not sProd in self.dHc[sLocalUsagePointId]:
+                self.dHc[sLocalUsagePointId][sProd] = {}
+            if not iWeekday in self.dHc[sLocalUsagePointId][sProd]:
+                self.dHc[sLocalUsagePointId][sProd][iWeekday] = []
             if matchHc.group(4):
-                iMinutesBegin = int(matchHc.group(3))
-            else:
-                iMinutesBegin = 0
-            if matchHc.group(6):
-                iMinutesEnd = int(matchHc.group(5))
-            else:
-                iMinutesEnd = 0
-            datetimeBegin = datetime(2010, 1, 1, int(matchHc.group(3)), iMinutesBegin)
-            datetimeEnd = datetime(2010, 1, 1, int(matchHc.group(5)), iMinutesEnd)
-            if (datetimeBegin.minute >= 30) :
-                datetimeBegin = datetimeBegin + timedelta(hours=1)
-            datetimeBegin = datetimeBegin.replace(minute=0)
-            if (datetimeEnd.minute >= 30) :
-                datetimeEnd = datetimeEnd + timedelta(hours=1)
-            datetimeEnd = datetimeEnd.replace(minute=0)
-            if datetimeEnd < datetimeBegin:
-                self.dHc[sLocalUsagePointId][iWeekday].append([datetimeBegin.time(), time(23,59,59,999999)])
-                self.dHc[sLocalUsagePointId][iWeekday].append([time(), datetimeEnd.time()])
-            else:
-                self.dHc[sLocalUsagePointId][iWeekday].append([datetimeBegin.time(), datetimeEnd.time()])
+                iHoursBegin = int(matchHc.group(4))
+                iHoursEnd = int(matchHc.group(6))
+
+                if matchHc.group(5):
+                    iMinutesBegin = int(matchHc.group(5))
+                else:
+                    iMinutesBegin = 0
+                if matchHc.group(7):
+                    iMinutesEnd = int(matchHc.group(7))
+                else:
+                    iMinutesEnd = 0
+
+                if iHoursBegin > 23:
+                    iHoursBegin = 23
+                    iMinutesBegin = 59
+                elif iHoursBegin < 0:
+                    iHoursBegin = 0
+
+                if iHoursEnd > 23:
+                    iHoursEnd = 23
+                    iMinutesEnd = 59
+                elif iHoursEnd < 0:
+                    iHoursEnd = 0
+
+                if iMinutesBegin > 59:
+                    iMinutesBegin = 59
+                elif iMinutesBegin < 0:
+                    iMinutesBegin = 0
+
+                if iMinutesEnd > 59:
+                    iMinutesEnd = 59
+                elif iMinutesEnd < 0:
+                    iMinutesEnd = 0
+                    
+                datetimeBegin = datetime(2010, 1, 1, iHoursBegin, iMinutesBegin)
+                datetimeEnd = datetime(2010, 1, 1, iHoursEnd, iMinutesEnd)
+                timeBegin = datetimeBegin.time()
+                timeEnd = datetimeEnd.time()
+                if datetimeEnd <  datetimeBegin:
+                    self.dHc[sLocalUsagePointId][sProd][iWeekday].append([timeBegin, time(23,59,59,999999)])
+                    self.dHc[sLocalUsagePointId][sProd][iWeekday].append([time(), timeEnd])
+                else:
+                    self.dHc[sLocalUsagePointId][sProd][iWeekday].append([timeBegin, timeEnd])
         #self.dumpDictToLog(self.dHc)
 
     # Check date if in cost 1 or cost 2
     def isCost2(self, dtDate, bProduction=False):
+        dtDate = dtDate - timedelta(minutes=30)
         tDate = dtDate.time()
+        dDate = dtDate.date()
         iWeekday = dtDate.weekday()
         lUsagePointCurrentId = self.sUsagePointId.split(USAGE_POINT_SEPARATOR)
         if bProduction and (len(lUsagePointCurrentId) > 1):
@@ -683,21 +764,36 @@ class BasePlugin:
         else:
             sLocalUsagePointId = lUsagePointCurrentId[0]
         if sLocalUsagePointId in self.dHc:
-            dHc = self.dHc[self.sUsagePointId]
+            dHc = self.dHc[sLocalUsagePointId]
         elif "all" in self.dHc:
             dHc = self.dHc["all"]
         else:
             return False
-        
-        if iWeekday in dHc:
-            lHc = dHc[iWeekday]
-        elif 7 in dHc:
-            lHc = dHc[7]
+
+        if bProduction:
+            if "prod" in dHc:
+                dPHc = dHc["prod"]
+            elif "all" in dHc:
+                dPHc = dHc["all"]
+            else:
+                return False
+        else:
+            if "all" in dHc:
+                dPHc = dHc["all"]
+            else:
+                return False
+            
+        if JoursFeries.is_bank_holiday(dDate) and (8 in dPHc):
+            lHc = dPHc[8]
+        elif iWeekday in dPHc:
+            lHc = dPHc[iWeekday]
+        elif 7 in dPHc:
+            lHc = dPHc[7]
         else:
             return False            
-        
+
         for lDateInterval in lHc:
-            if (tDate > lDateInterval[0]) and (tDate <= lDateInterval[1]):
+            if (tDate >= lDateInterval[0]) and (tDate < lDateInterval[1]):
                 return True
         return False
 
@@ -728,12 +824,17 @@ class BasePlugin:
 
         # sorting needed to accumulate
         for sDate, dOneData in sorted(dUsagePointData.items()):
+            # transform hour data in day data
+            dOneData["consumption1"] = 0
             for iHour, fValue in dOneData["consumption1_hours"].items():
                 dOneData["consumption1"] = dOneData["consumption1"] + fValue
+            dOneData["consumption2"] = 0
             for iHour, fValue in dOneData["consumption2_hours"].items():
                 dOneData["consumption2"] = dOneData["consumption2"] + fValue
+            dOneData["production1"] = 0
             for iHour, fValue in dOneData["production1_hours"].items():
                 dOneData["production1"] = dOneData["production1"] + fValue
+            dOneData["production2"] = 0
             for iHour, fValue in dOneData["production2_hours"].items():
                 dOneData["production2"] = dOneData["production2"] + fValue
             # hour
@@ -743,11 +844,11 @@ class BasePlugin:
                 if not dOneData["data"]:
                     continue
                 if dOneData["date"] >= self.savedDateEndDays2:
-                    # Domoticz.Error("Skip " + sDate)
+                    # self.myError("Skip " + sDate)
                     continue
                 # We want only iHistoryDaysForHoursView days
                 if (self.iHistoryDaysForHoursView < 1) or (dOneData["date"] < self.dateBeginDaysHistoryView):
-                    # Domoticz.Error("Skip " + sDate)
+                    # self.myError("Skip " + sDate)
                     continue
                 iConsumption1 = iConsumption1 + dOneData["consumption1"]
                 iConsumption2 = iConsumption2 + dOneData["consumption2"]
@@ -766,7 +867,7 @@ class BasePlugin:
                     continue
                 # We don't want the last day = today, it's incomplete
                 if dOneData["date"] >= self.savedDateEndDays2:
-                    # Domoticz.Error("Skip " + sDate)
+                    # self.myError("Skip " + sDate)
                     continue
                 if not self.addToDevice(oDevice, dOneData["consumption1"], dOneData["consumption2"], dOneData["production1"],
                                         dOneData["production2"], sDate):
@@ -779,9 +880,21 @@ class BasePlugin:
         bResult = True
         dCalculateCopy = self.dCalculate.copy()
         for sUsagePointConsumptionId in dCalculateCopy:
-            if (not dCalculateCopy[sUsagePointConsumptionId]["production1"]["value_year"]) and (not dCalculateCopy[sUsagePointConsumptionId]["production2"]["value_year"]):
+            # Check if consumption only
+            if (
+                not dCalculateCopy[sUsagePointConsumptionId]["production1"]["value_year"]
+                and not dCalculateCopy[sUsagePointConsumptionId]["production2"]["value_year"]
+                and (dCalculateCopy[sUsagePointConsumptionId]["consumption1"]["value_year"]
+                    or dCalculateCopy[sUsagePointConsumptionId]["consumption2"]["value_year"])
+            ):
                 for sUsagePointProductionId in dCalculateCopy:
-                    if (not dCalculateCopy[sUsagePointProductionId]["consumption1"]["value_year"]) and (not dCalculateCopy[sUsagePointProductionId]["consumption2"]["value_year"]):
+                    # Merge with production only
+                    if (
+                        not dCalculateCopy[sUsagePointProductionId]["consumption1"]["value_year"]
+                        and not dCalculateCopy[sUsagePointProductionId]["consumption2"]["value_year"]
+                        and (dCalculateCopy[sUsagePointProductionId]["production1"]["value_year"]
+                            or dCalculateCopy[sUsagePointProductionId]["production2"]["value_year"])
+                    ):
                         # Do merge
                         sNewUsagePointId = sUsagePointConsumptionId + USAGE_POINT_SEPARATOR + sUsagePointProductionId
 
@@ -817,6 +930,8 @@ class BasePlugin:
                                 dMergedData["peak"] = dProdData["peak"]
                                 self.dData[sNewUsagePointId][sDate] = dMergedData
 
+                        self.bNoConsumption = False
+                        self.bNoProduction = False
                         if not self.saveDataToDb(sNewUsagePointId):
                             bResult = False
         return bResult
@@ -904,10 +1019,10 @@ class BasePlugin:
                             #curDate = enedisDateTimeToDatetime(data["date"]) + timedelta(hours=1)
                             curDate = enedisDateTimeToDatetime(data["date"])
                             accumulation = accumulation + val
-                            # Domoticz.Log("Value " + str(val) + " " + datetimeToSQLDateTimeString(curDate))
+                            # self.myLog("Value " + str(val) + " " + datetimeToSQLDateTimeString(curDate))
                             if curDate.minute == 0:
                                 # Check that we had enough data, as expected
-                                # Domoticz.Log("accumulation " + str(accumulation / steps) + " " + datetimeToSQLDateTimeString(curDate))
+                                # self.myLog("accumulation " + str(accumulation / steps) + " " + datetimeToSQLDateTimeString(curDate))
                                 # if not self.createAndAddToDevice(accumulation / steps, datetimeToSQLDateTimeString(curDate)):
                                 # return False
                                 self.manageDataHours(accumulation / steps, curDate, bProduction)
@@ -939,7 +1054,7 @@ class BasePlugin:
         ldpweek = self.fdweek - timedelta(days=1)
         self.fdpweek = ldpweek - timedelta(days=6)
         self.fdyear = self.prevDay.replace(day=1, month=1)
-        #Domoticz.Log(
+        #self.myLog(
         #    str(self.prevDay) + " " + str(self.curDay) + " " + str(self.fdmonth) + " " + str(self.fdpmonth) + " " + str(
         #       self.fdweek) + " " + str(self.fdpweek) + " " + str(self.fdyear))
 
@@ -1029,7 +1144,7 @@ class BasePlugin:
                                 curDate = enedisDateTimeToDatetime(data["date"])
                             else:
                                 curDate = enedisDateToDatetime(data["date"])
-                            #Domoticz.Log("Value " + str(val) + " " + datetimeToSQLDateString(curDate))
+                            #self.myLog("Value " + str(val) + " " + datetimeToSQLDateString(curDate))
                             # self.dumpDictToLog(values)
                             # self.dayAccumulate(curDate, val)
                             # if not self.createAndAddToDevice(val, datetimeToSQLDateString(curDate)):
@@ -1122,6 +1237,16 @@ class BasePlugin:
             if SCalcT2 in self.dCalculate[sUsagePointCurrentId][sProd1T2]:
                 fSecVal2 = self.dCalculate[sUsagePointCurrentId][sProd1T2][SCalcT2]
 
+        # Set value to 0 when no production only or no consumption only, to not trigger error
+        if self.bNoConsumption and (not self.bNoProduction):
+            fConsoVal1 = 0
+            fConsoVal2 = 0
+            fSecVal1 = 0
+            fSecVal2 = 0
+        elif self.bNoProduction and (not self.bNoConsumption):
+            fProdVal1 =0
+            fProdVal2 =0
+
         if (fConsoVal1 < 0) or (fConsoVal2 < 0) or (fProdVal1 < 0) or (fProdVal2 < 0) or (fSecVal1 < 0) or (fSecVal2 < 0):
             self.showStepError(False, "Données manquantes pour mettre à jour le tableau de bord")
             return False
@@ -1165,7 +1290,7 @@ class BasePlugin:
         self.dateEndDays = self.savedDateEndDays
         self.savedDateEndDays = self.dateBeginDays
 
-        # Domoticz.Log("Dates : " + datetimeToSQLDateTimeString(self.dateBeginDays) + " " + datetimeToSQLDateTimeString(self.dateEndDays) + " " + datetimeToSQLDateTimeString(self.savedDateEndDays))
+        # self.myLog("Dates : " + datetimeToSQLDateTimeString(self.dateBeginDays) + " " + datetimeToSQLDateTimeString(self.dateEndDays) + " " + datetimeToSQLDateTimeString(self.savedDateEndDays))
 
         # No more than 7 days at once
         self.iDaysLeftHoursView = self.iDaysLeftHoursView - 7
@@ -1179,7 +1304,7 @@ class BasePlugin:
 
         self.bFirstBatch = False
 
-        # Domoticz.Log("Dates : " + datetimeToSQLDateTimeString(self.dateBeginHours) + " " + datetimeToSQLDateTimeString(self.dateEndHours) + " " + datetimeToSQLDateTimeString(self.savedDateEndDaysForHoursView))
+        # self.myLog("Dates : " + datetimeToSQLDateTimeString(self.dateBeginHours) + " " + datetimeToSQLDateTimeString(self.dateEndHours) + " " + datetimeToSQLDateTimeString(self.savedDateEndDaysForHoursView))
 
     # Still data to get
     def stillDays(self, bPeak):
@@ -1191,24 +1316,23 @@ class BasePlugin:
     # Calculate next complete grab, for tomorrow between 8 and 9 am if tomorrow is true, for next hour otherwise, prevent connection between 10 pm and 8 am
     def setNextConnection(self, bTomorrow):
         bForceTomorrow = False
-        self.iUsagePointIndex = 0
         dtNow = datetime.now()
         if not bTomorrow:
             self.dateNextConnection = dtNow + timedelta(hours=1)
-            if self.dateNextConnection.hour >= 22: 
+            if self.dateNextConnection.hour >= 22:
                 bForceTomorrow = True
         if bTomorrow or bForceTomorrow:
-            if bForceTomorrow:
-                Domoticz.Error("Serveurs inaccessibles à cette heure, prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
+            self.dateNextConnection = dtNow.replace(hour=8, minute=0)
+            self.dateNextConnection = self.dateNextConnection + timedelta(days=1)
             minutesRand = round(dtNow.microsecond / 10000) % 60
-            self.dateNextConnection = dtNow + timedelta(days=1)
-            self.dateNextConnection = self.dateNextConnection.replace(hour=8, minute=0)
             self.dateNextConnection = self.dateNextConnection + timedelta(minutes=minutesRand)
+            if bForceTomorrow:
+                self.myError("Serveurs inaccessibles à cette heure, prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
         # Randomize minutes to lower load on Enedis website
         # randint makes domoticz crash on RPI
         # self.dateNextConnection = self.dateNextConnection + timedelta(minutes=randint(0, 59), seconds=randint(0, 59))
         # We take microseconds to randomize
-        return bTomorrow
+        return bTomorrow or bForceTomorrow
 
     # Calculate next connection after a few seconds, prevent connection between 10 pm and 8 am
     def setNextConnectionForLater(self, iInterval):
@@ -1216,19 +1340,21 @@ class BasePlugin:
         dtNow = datetime.now()
         self.dateNextConnection = dtNow + timedelta(seconds=iInterval)
         if self.dateNextConnection.hour >= 22: 
+            self.dateNextConnection = dtNow.replace(hour=8, minute=0)
             self.dateNextConnection = self.dateNextConnection + timedelta(days=1)
-            self.dateNextConnection = self.dateNextConnection.replace(hour=8, minute=0)
             bTomorrow = True
         elif self.dateNextConnection.hour < 8: 
-            self.dateNextConnection = self.dateNextConnection.replace(hour=8, minute=0)
+            self.dateNextConnection = dtNow.replace(hour=8, minute=0)
             bTomorrow = True
         if bTomorrow:
             minutesRand = round(dtNow.microsecond / 10000) % 60
             self.dateNextConnection = self.dateNextConnection + timedelta(minutes=minutesRand)
-            Domoticz.Error("Serveurs inaccessibles à cette heure, prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
+            self.sConnectionStep = "idle"
+            self.myError("Serveurs inaccessibles à cette heure, prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
         return bTomorrow
 
     def clearData(self):
+        self.iUsagePointIndex = 0
         self.dData = dict()
         self.dCalculate = dict()
         self.bHasAFail = False
@@ -1249,9 +1375,10 @@ class BasePlugin:
 
         # First and last step
         if self.sConnectionStep == "idle":
-            Domoticz.Log("Récupération des données...")
+            self.myStatus("Récupération des données...")
             # Reset data
             self.clearData()
+            self.resetDates(datetime(self.dateNextConnection.year, self.dateNextConnection.month, self.dateNextConnection.day) - timedelta(days=1))
 
             # If we have access tokens, try do grab data, otherwise ask for tokens
             if getConfigItem("access_token", ""):
@@ -1339,10 +1466,13 @@ class BasePlugin:
                 self.showSimpleStatusError(Data)
                 self.disablePlugin()
             elif (iStatus == 404) or self.bProdMode and (iStatus == 400):
-                self.showStatusError(True, Data, True)
+                #self.showStatusError(True, Data, True)
                 if self.bFirstBatch:
-                    self.iDataErrorCount = self.iDataErrorCount + 1
-                    if self.iDataErrorCount > 1:
+                    if (self.bProdMode):
+                        self.bNoProduction = True
+                    else:
+                        self.bNoConsumption = True
+                    if self.bNoConsumption and self.bNoProduction:
                         #self.showStatusError(True, Data)
                         self.showStepError(True, "Pas de données disponibles, avez-vous associé un compteur à votre compte et demandé l'enregistrement et la collecte des données horaire sur le site d'Enedis (dans \"Gérer l'accès à mes données\") ?")
                         self.bHasAFail = True
@@ -1452,12 +1582,13 @@ class BasePlugin:
         # next consumption point
         if self.sConnectionStep == "nextcons":
             self.sUsagePointId = self.lUsagePointIndex[self.iUsagePointIndex].upper().strip()
-            Domoticz.Log("Traitement pour le point de livraison " + self.sUsagePointId)
+            self.myStatus("Traitement pour le point de livraison " + self.sUsagePointId)
             if self.bHasAFail:
                 self.bGlobalHasAFail = True
                 self.bHasAFail = False
             self.bProdMode = False
-            self.iDataErrorCount = 0
+            self.bNoConsumption = False
+            self.bNoProduction = False
             self.sConnectionStep = "next"
 
         # next consumption or production point
@@ -1476,7 +1607,7 @@ class BasePlugin:
                 self.setNextConnection(False)
             self.clearData()
             self.sConnectionStep = "idle"
-            Domoticz.Log("Prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
+            self.myStatus("Prochaine connexion : " + datetimeToSQLDateTimeString(self.dateNextConnection))
 
     def dumpDictToLog(self, dictToLog):
         if self.iDebugLevel:
@@ -1497,6 +1628,27 @@ class BasePlugin:
                 self.myDebug("Received no dict: " + str(dictToLog))
 
     def onStart(self):
+        try:
+            self.iDebugLevel = int(Parameters["Mode3"])
+        except ValueError:
+            self.iDebugLevel = 0
+            
+        if self.iDebugLevel > 0:
+            self.fDebug = tempfile.NamedTemporaryFile(mode='w+t', delete=False, prefix="DomoticzLinky" + datetime.now().strftime("_%Y_%m_%d_%H_%M_%S_"), suffix=".log")
+
+        if self.iDebugLevel > 1:
+            Domoticz.Debugging(1)
+
+        if self.iDebugLevel == 3:
+            resetTokens()
+
+        if self.iDebugLevel >= 10:
+            self.iAlternateAddress = 1
+            self.iFalseCustomer = self.iDebugLevel - 10
+        else:
+            self.iAlternateAddress = 0
+            self.iFalseCustomer = 0
+
         self.myDebug("onStart called")
 
         self.iAlternateDevice = 1
@@ -1512,11 +1664,11 @@ class BasePlugin:
         # self.iAlternateDevice = 1
 
         if self.iAlternateDevice:
-            Domoticz.Log(
+            self.myLog(
                 "Ce plugin est compatible avec Domoticz version 4.11070 mais la visualisation d'énergie produite et de tarification horaire ne peuvent fonctionner qu'à partir de la version 4.11774")
 
         if iVersion < 4011070:
-            Domoticz.Error(
+            self.myError(
                 "Votre version de Domoticz est trop ancienne")
             self.isEnabled = False
             return
@@ -1536,24 +1688,6 @@ class BasePlugin:
 
         if not self.sConsumptionType2:
             self.sConsumptionType2 = "peak_day"
-
-        try:
-            self.iDebugLevel = int(Parameters["Mode3"])
-        except ValueError:
-            self.iDebugLevel = 0
-
-        if self.iDebugLevel > 1:
-            Domoticz.Debugging(1)
-
-        if self.iDebugLevel == 3:
-            resetTokens()
-
-        if self.iDebugLevel >= 10:
-            self.iAlternateAddress = 1
-            self.iFalseCustomer = self.iDebugLevel - 10
-        else:
-            self.iAlternateAddress = 0
-            self.iFalseCustomer = 0
 
         # History for short log is 7 days max (default to 7)
         try:
@@ -1599,16 +1733,18 @@ class BasePlugin:
             self.iHistoryDaysForPeakDaysView = 366
 
         if self.sTarif:
-            Domoticz.Log("Heures creuses mises à " + self.sTarif)
+            self.myLog("Heures creuses mises à " + self.sTarif)
         else:
-            Domoticz.Log("Heures creuses désactivées")
-        Domoticz.Log(
+            self.myLog("Heures creuses désactivées")
+        self.myLog(
             "Consommation à montrer sur le tableau de bord mis à " + self.sConsumptionType1 + " / " + self.sConsumptionType2)
-        Domoticz.Log("Nombre de jours à récupérer pour la vue par heures mis à " + str(self.iHistoryDaysForHoursView))
-        Domoticz.Log("Nombre de jours à récupérer pour les autres vues mis à " + str(self.iHistoryDaysForDaysView))
-        Domoticz.Log(
+        self.myLog("Nombre de jours à récupérer pour la vue par heures mis à " + str(self.iHistoryDaysForHoursView))
+        self.myLog("Nombre de jours à récupérer pour les autres vues mis à " + str(self.iHistoryDaysForDaysView))
+        self.myLog(
             "Nombre de jours à récupérer pour le calcul du pic mis à " + str(self.iHistoryDaysForPeakDaysView))
-        Domoticz.Log("Debug mis à " + str(self.iDebugLevel))
+        self.myLog("Debug mis à " + str(self.iDebugLevel))
+        if self.fDebug:
+            self.myStatus("Log dans le fichier " + self.fDebug.name + " pour la version " + str(Parameters["Version"]) + " du plugin")
 
         # Parameter for tarif 1/2
         self.parseHcParameter(self.sTarif)
@@ -1616,7 +1752,7 @@ class BasePlugin:
         # most init
         self.__init__()
 
-        Domoticz.Log(
+        self.myLog(
             "Si vous ne voyez pas assez de données dans la vue par heures, augmentez le paramètre Log des capteurs qui se trouve dans Réglages / Paramètres / Historique des logs")
 
         dtNow = datetime.now()
@@ -1631,6 +1767,8 @@ class BasePlugin:
         Domoticz.Debug("onStop called")
         # prevent error messages during disabling plugin
         self.isStarted = False
+        if self.fDebug:
+            self.fDebug.flush()
 
     def onConnect(self, Connection, Status, Description):
         Domoticz.Debug("onConnect called")
@@ -1659,6 +1797,9 @@ class BasePlugin:
     def onHeartbeat(self):
         Domoticz.Debug("onHeartbeat() called")
 
+        if self.fDebug:
+            self.fDebug.flush()
+
         if self.isEnabled:
             dtNow = datetime.now()
 
@@ -1672,7 +1813,7 @@ class BasePlugin:
                 for oDevice in Devices.values():
                     bHasLocalTimeout = False
                     if oDevice.DeviceID in self.dUsagePointTimeout:
-                        #Domoticz.Log(str(bHasGlobalTimeout) + " " + str(bHasLocalTimeout) + " " + str(self.dUsagePointTimeout[oDevice.DeviceID]) + " " + str(self.dtGlobalTimeout) + " " + str(self.dtNextRefresh))
+                        #self.myLog(str(bHasGlobalTimeout) + " " + str(bHasLocalTimeout) + " " + str(self.dUsagePointTimeout[oDevice.DeviceID]) + " " + str(self.dtGlobalTimeout) + " " + str(self.dtNextRefresh))
                         if dtNow > self.dUsagePointTimeout[oDevice.DeviceID]:
                             bHasLocalTimeout = True
                     # Update the device at a regular basis to prevent usage to be shown at 0
@@ -1682,9 +1823,6 @@ class BasePlugin:
                         oDevice.Touch()
 
             if dtNow > self.dateNextConnection:
-                # self.savedDateEndDays = self.dateNextConnection
-                self.resetDates(
-                    datetime(self.dateNextConnection.year, self.dateNextConnection.month, self.dateNextConnection.day))
                 # We immediatly program next connection for tomorrow, if there is a problem, we will reprogram it sooner
                 self.setNextConnection(True)
                 self.handleConnection()
@@ -1749,12 +1887,16 @@ def onHeartbeat():
 
 
 # Generic helper functions
-def setTimeout(dtDate=datetime.now()):
+def setTimeout(dtDate=None):
+    if dtDate is None:
+        dtDate = datetime.now()
     return dtDate + timedelta(days=1, hours=12)
 
 
-def setRefreshTime(dtDate=datetime.now()):
+def setRefreshTime(dtDate=None):
 #    return dtDate + timedelta(minutes=10)
+    if dtDate is None:
+        dtDate = datetime.now()
     return dtDate + timedelta(seconds=50)
 
 
@@ -1769,7 +1911,7 @@ def getConfigItem(Key=None, Default={}):
     except KeyError:
         Value = Default
     except Exception as inst:
-        Domoticz.Error("Domoticz.Configuration read failed: '" + str(inst) + "'")
+        self.myError("Domoticz.Configuration read failed: '" + str(inst) + "'")
     return Value
 
 
@@ -1783,7 +1925,7 @@ def setConfigItem(Key=None, Value=None):
             Config = Value  # set whole configuration if no key specified
         Config = Domoticz.Configuration(Config)
     except Exception as inst:
-        Domoticz.Error("Domoticz.Configuration operation failed: '" + str(inst) + "'")
+        self.myError("Domoticz.Configuration operation failed: '" + str(inst) + "'")
     return Config
 
 
@@ -1880,3 +2022,210 @@ def datetimeToSQLDateString(datetimeObj):
 # Convert datetime object to Domoticz date and time string
 def datetimeToSQLDateTimeString(datetimeObj):
     return datetimeObj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# The JoursFeries class code after that comes from https://github.com/etalab/jours-feries-france and here is its original license:
+
+#MIT License
+
+#Copyright (c) 2020 Etalab
+
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+#The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+class JoursFeries(object):
+    ZONES = [
+        "Métropole",
+        "Alsace-Moselle",
+        "Guadeloupe",
+        "Guyane",
+        "Martinique",
+        "Mayotte",
+        "Nouvelle-Calédonie",
+        "La Réunion",
+        "Polynésie Française",
+        "Saint-Barthélémy",
+        "Saint-Martin",
+        "Wallis-et-Futuna",
+        "Saint-Pierre-et-Miquelon",
+    ]
+
+    def __init__(self):
+        super(JoursFeries, self).__init__()
+
+    @staticmethod
+    def check_zone(zone):
+        zone = zone or "Métropole"
+
+        if zone not in JoursFeries.ZONES:
+            valid_values = ", ".join(JoursFeries.ZONES)
+            raise ValueError(
+                "%s is invalid. Supported values: %s" % (zone, valid_values)
+            )
+
+        return zone
+
+    @staticmethod
+    def is_bank_holiday(date, zone=None):
+        return date in JoursFeries.for_year(date.year, zone).values()
+
+    @staticmethod
+    def next_bank_holiday(date, zone=None):
+        while not JoursFeries.is_bank_holiday(date, zone):
+            date = date + timedelta(days=1)
+
+        return [
+            (k, v)
+            for k, v in JoursFeries.for_year(date.year, zone).items()
+            if v == date
+        ][0]
+
+    @staticmethod
+    def for_year(year, zone=None):
+        JoursFeries.check_zone(zone)
+
+        bank_holidays = {
+            "1er janvier": JoursFeries.premier_janvier(year),
+            "1er mai": JoursFeries.premier_mai(year),
+            "8 mai": JoursFeries.huit_mai(year),
+            "14 juillet": JoursFeries.quatorze_juillet(year),
+            "Assomption": JoursFeries.assomption(year),
+            "Toussaint": JoursFeries.toussaint(year),
+            "11 novembre": JoursFeries.onze_novembre(year),
+            "Jour de Noël": JoursFeries.jour_noel(year),
+            "Lundi de Pâques": JoursFeries.lundi_paques(year),
+            "Ascension": JoursFeries.ascension(year),
+            "Lundi de Pentecôte": JoursFeries.lundi_pentecote(year),
+            "Vendredi saint": JoursFeries.vendredi_saint(year, zone),
+            "2ème jour de Noël": JoursFeries.deuxieme_jour_noel(year, zone),
+            "Abolition de l'esclavage": JoursFeries.abolition_esclavage(year, zone),
+        }
+
+        bank_holidays = {k: v for k, v in bank_holidays.items() if v}
+
+        return {
+            k: v for k, v in sorted(bank_holidays.items(), key=lambda item: item[1])
+        }
+
+    @staticmethod
+    def paques(year):
+        if year < 1886:
+            return None
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = (19 * a + b - b // 4 - ((b - (b + 8) // 25 + 1) // 3) + 15) % 30
+        e = (32 + 2 * (b % 4) + 2 * (c // 4) - d - (c % 4)) % 7
+        f = d + e - 7 * ((a + 11 * d + 22 * e) // 451) + 114
+        month = f // 31
+        day = f % 31 + 1
+        return date(year, month, day)
+
+    @staticmethod
+    def lundi_paques(year):
+        if year >= 1886:
+            return JoursFeries.paques(year) + timedelta(days=1)
+        return None
+
+    @staticmethod
+    def vendredi_saint(year, zone):
+        if zone == JoursFeries.check_zone("Alsace-Moselle"):
+            return JoursFeries.paques(year) - timedelta(days=2)
+        return None
+
+    @staticmethod
+    def ascension(year):
+        if year >= 1802:
+            return JoursFeries.paques(year) + timedelta(days=39)
+        return None
+
+    @staticmethod
+    def lundi_pentecote(year):
+        if year >= 1886:
+            return JoursFeries.paques(year) + timedelta(days=50)
+        return None
+
+    @staticmethod
+    def premier_janvier(year):
+        if year > 1810:
+            return date(year, 1, 1)
+        return None
+
+    @staticmethod
+    def premier_mai(year):
+        if year > 1919:
+            return date(year, 5, 1)
+        return None
+
+    @staticmethod
+    def huit_mai(year):
+        if (1953 <= year <= 1959) or year > 1981:
+            return date(year, 5, 8)
+        return None
+
+    @staticmethod
+    def quatorze_juillet(year):
+        if year >= 1880:
+            return date(year, 7, 14)
+        return None
+
+    @staticmethod
+    def toussaint(year):
+        if year >= 1802:
+            return date(year, 11, 1)
+        return None
+
+    @staticmethod
+    def assomption(year):
+        if year >= 1802:
+            return date(year, 8, 15)
+        return None
+
+    @staticmethod
+    def onze_novembre(year):
+        if year >= 1918:
+            return date(year, 11, 11)
+        return None
+
+    @staticmethod
+    def jour_noel(year):
+        if year >= 1802:
+            return date(year, 12, 25)
+        return None
+
+    @staticmethod
+    def deuxieme_jour_noel(year, zone):
+        if zone == JoursFeries.check_zone("Alsace-Moselle"):
+            return date(year, 12, 26)
+        return None
+
+    @staticmethod
+    def abolition_esclavage(year, zone):
+        if zone == JoursFeries.check_zone("Mayotte"):
+            return date(year, 4, 27)
+
+        if zone == JoursFeries.check_zone("Martinique"):
+            return date(year, 5, 22)
+
+        if zone == JoursFeries.check_zone("Guadeloupe"):
+            return date(year, 5, 27)
+
+        if zone == JoursFeries.check_zone("Saint-Martin"):
+            if year >= 2018:
+                return date(year, 5, 28)
+            else:
+                return date(year, 5, 27)
+
+        if zone == JoursFeries.check_zone("Guyane"):
+            return date(year, 6, 10)
+
+        if zone == JoursFeries.check_zone("Saint-Barthélémy"):
+            return date(year, 10, 9)
+
+        if zone == JoursFeries.check_zone("La Réunion") and year >= 1981:
+            return date(year, 12, 20)
+
+        return None
